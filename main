@@ -1,0 +1,106 @@
+import requests
+import psycopg2
+import os
+from datetime import datetime
+
+API_URL = "https://mds.dashboarddeelmobiliteit.nl/stops?municipality=GM0363"
+
+# -----------------------------
+# DB connectie (zelfde als jouw script)
+# -----------------------------
+conn = psycopg2.connect(
+    host=os.environ["DB_HOST"],
+    port=os.environ["DB_PORT"],
+    user=os.environ["DB_USER"],
+    password=os.environ["DB_PASSWORD"],
+    dbname=os.environ["DB_NAME"],
+    sslmode="require"
+)
+cursor = conn.cursor()
+
+print("DB connectie gelukt!")
+
+# -----------------------------
+# API fetch met retry
+# -----------------------------
+def fetch_api():
+    for attempt in range(3):
+        try:
+            r = requests.get(API_URL, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            print(f"API fout (poging {attempt + 1}/3):", e)
+    return None
+
+data = fetch_api()
+
+if not data:
+    print("API niet beschikbaar")
+    exit(1)
+
+stops = data.get("data", {}).get("stops", [])
+timestamp = datetime.utcnow()
+
+total_events = 0
+
+for stop in stops:
+    stop_id = stop["stop_id"]
+
+    vehicles = stop.get("num_vehicles_available", {})
+    bicycle = vehicles.get("bicycle", 0)
+    moped = vehicles.get("moped", 0)
+
+    # vorige status ophalen
+    cursor.execute(
+        "SELECT bicycle, moped FROM stops_state WHERE stop_id=%s",
+        (stop_id,)
+    )
+    prev = cursor.fetchone()
+
+    if prev:
+        prev_bicycle, prev_moped = prev
+
+        delta_bicycle = bicycle - prev_bicycle
+        delta_moped = moped - prev_moped
+
+        # 📉 alleen meenemen (negatief)
+        if delta_bicycle < 0:
+            cursor.execute(
+                """
+                INSERT INTO usage_events (stop_id, vehicle_type, change, timestamp)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (stop_id, "bicycle", delta_bicycle, timestamp)
+            )
+            total_events += abs(delta_bicycle)
+
+        if delta_moped < 0:
+            cursor.execute(
+                """
+                INSERT INTO usage_events (stop_id, vehicle_type, change, timestamp)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (stop_id, "moped", delta_moped, timestamp)
+            )
+            total_events += abs(delta_moped)
+
+    # 🔄 state updaten (UPSERT)
+    cursor.execute(
+        """
+        INSERT INTO stops_state (stop_id, bicycle, moped, last_updated)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (stop_id) DO UPDATE SET
+            bicycle = EXCLUDED.bicycle,
+            moped = EXCLUDED.moped,
+            last_updated = EXCLUDED.last_updated
+        """,
+        (stop_id, bicycle, moped, timestamp)
+    )
+
+conn.commit()
+
+print(timestamp, "| usage events:", total_events)
+
+cursor.close()
+conn.close()
